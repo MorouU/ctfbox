@@ -4,6 +4,13 @@ from ctfbox.thirdparty.phpserialize import serialize, unserialize
 
 
 class TestWeb(unittest.TestCase):
+
+    def test_hashAuth(self):
+        self.assertEqual(hashAuth(answer="02fcf"), "16221")
+        self.assertEqual(hashAuth(answer="d13ce", hashType=HashType.SHA1), "16221")
+        self.assertEqual(hashAuth(answer="c907773", endIndex=7, threadNum=50), "500000")
+        self.assertEqual(hashAuth(answer="59e711d", endIndex=7, maxRange=2000000), "1000001")
+
     def test_get_flask_pin(self):
         self.assertEqual(get_flask_pin("kingkk", "/home/kingkk/.local/lib/python3.5/site-packages/flask/app.py",
                                        "00:0c:29:e5:45:6a", "19949f18ce36422da1402b3e3fe53008"), "169-851-075")
@@ -80,9 +87,9 @@ Syclover
 
         payload = 's:8:"password";s:9:"123456.00"'
         # diff_len = 1
-        payload_dict = php_serialize_escape_s2l('x', 'yy', payload)
+        payload_dict = php_serialize_escape_s2l('!', '@@', payload)
         u = User(payload_dict.get('insert_data'), '123456')
-        s = serialize(u).replace(b'x', b'yy')
+        s = serialize(u).replace(b'!', b'@@')
         s = s.decode()
         d = unserialize(s)._asdict()
         self.assertEqual('123456.00', d['password'])
@@ -102,9 +109,9 @@ Syclover
                 self.password = password
                 self.sign = 'hello'
 
-        payload_dict = php_serialize_escape_s2l('x', 'yyyyyy', payload, True)
+        payload_dict = php_serialize_escape_s2l('!', '@@@@@', payload, True)
         u = User(payload_dict.get('insert_data'), '123456')
-        s = serialize(u).replace(b'x', b'yyyyyy')
+        s = serialize(u).replace(b'!', b'@@@@@')
         s = s.decode()
         d = unserialize(s)._asdict()
         self.assertEqual('123456.00', d['password'])

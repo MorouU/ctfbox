@@ -21,3 +21,27 @@ class GeneratePayloadError(CtfboxError):
 
 class HttprawError(CtfboxError):
     pass
+
+
+class ScanError(CtfboxError):
+    pass
+
+
+class RepairError(CtfboxError):
+    pass
+
+
+class DumpError(CtfboxError):
+    pass
+
+
+class GitParseError(DumpError):
+    pass
+
+
+class SvnParseError(DumpError):
+    pass
+
+
+class DSStoreParseError(DumpError):
+    pass

